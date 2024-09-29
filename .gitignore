@@ -1,0 +1,5 @@
+node_modules
+tests/*
+uploads/*
+profilepics/*
+channel_icons/*
