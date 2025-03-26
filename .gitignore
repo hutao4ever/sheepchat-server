@@ -3,3 +3,6 @@ tests/*
 uploads/*
 profilepics/*
 channel_icons/*
+pass.txt
+.VSCodeCounter
+deploy.sh

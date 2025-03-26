@@ -1,18 +1,20 @@
 const express = require("express")
-const app = express()
 const session = require('express-session')
 const crypto = require('crypto')
 const {createServer} = require("http")
-const ChatServer = require("./socket_server.js")
+const {broadcast_sync_channel, broadcast_invite, load_offserver_channel, query_user, join_remote_channel} = require("./sync")
+const {init_sync, init_socket_server, get_fileshare_peers} = require("./socket_server")
 const busboy = require('connect-busboy')
+const { io } = require("socket.io-client");
+const {PORT} = require("./config/port")
+
+const app = express();
 
 const user_routes = require("./routes/user_routes")
 const chat_routes = require("./routes/chat_routes")
 
 const {upload_max_size} = require("./config/fileupload")
-const { sync } = require("./sync.js")
-const SYNC_ENABLE = require("./config/sync.js").ENABLE;
-const SYNC_HOST = require("./config/sync.js").host;
+const { main_server, server_id, role, ENABLE } = require("./config/sync")
 
 //the server
 const httpserver = createServer(app)
@@ -31,23 +33,40 @@ app.use(busboy({
     }
 }));
 
+app.use("/static", express.static("static"));
 app.use(session_middleware);
 app.use(express.json());
 app.use(express.urlencoded({extended:false}));
 
-new ChatServer(httpserver);
+//for recieving events from secondary sheepchat servers
+if(ENABLE){
+    if(role=="main"){
+        const namespaces = init_socket_server(httpserver);
+        var sync_socket = init_sync(namespaces[0], namespaces[1], false, server_id);
+    }else{
+        console.log("running as secondary server.");
+        const socket = io.connect(String(new URL("/server", main_server)),{
+            query:{interservercomm:true,serverID:server_id,appPort:PORT}
+        });
+        const namespaces = init_socket_server(httpserver, socket);
+        var sync_socket = init_sync(socket, namespaces[1], true, server_id);
+    }
+}else{
+    var sync_socket = null;
+}
 
+app.use((req,res,next)=>{
+    req.sync_channel=(channel)=>{broadcast_sync_channel(sync_socket, channel)}
+    req.sync_invite=(invite)=>{broadcast_invite(sync_socket, invite)}
+    req.load_offserver_channel=async(channel)=>{return await load_offserver_channel(sync_socket, channel)}
+    req.query_user=async(userid)=>{return await query_user(sync_socket, userid)}
+    req.join_remote_channel=async(channel, userid)=>{return await join_remote_channel(sync_socket, channel, userid)}
+    req.file_share_peers=get_fileshare_peers;
+    next();
+});
 app.use(user_routes);
 app.use(chat_routes);
 
-httpserver.listen(8080,()=>{
-    console.log('Web app is listening on port 8080.');
+httpserver.listen(PORT,()=>{
+    console.log('Web app is listening on port %d.', PORT);
 })
-
-//the sync server
-if(SYNC_ENABLE){
-    const sync_server = createServer(sync);
-    sync_server.listen(8083, SYNC_HOST, ()=>{
-        console.log(`Sync server is listening on ${SYNC_HOST}:8083`);
-    });
-}

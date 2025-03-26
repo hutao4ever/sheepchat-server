@@ -1,108 +1,183 @@
-const busboy = require("busboy");
-const maindb = require("./mysql_db");
-const FormData = require("form-data");
+const db = require("./db");
 const fs = require("fs");
-const {Worker} = require('node:worker_threads');
 const {ENABLE} = require("./config/sync");
 
-var handler_incremental_id = 0;
+var log_failure = (failed_event, data)=>{
+    const timestamp = Date.now();
+    fs.appendFile('message.txt', JSON.stringify([timestamp,failed_event,data]), function (err) {
+        if (err) throw err;
+        console.log(`Written a failed event on ${new Date(timestamp).toUTCString()}`);
+    });
+}
 
-//remote to local handler
-module.exports.sync = (req, res)=>{
-    if(req.url == "/sync/file" && req.method == "POST"){
-        try{
-            var bb = busboy({headers:req.headers});
-        }catch(e){
-            console.log(e);
-            res.writeHead(400, { Connection:'close'});
-            res.end();
+module.exports.log_failure = log_failure;
+
+module.exports.broadcast_sync_channel = (socket, channel)=>{
+  if(!ENABLE){
+    return false;
+  }
+  
+  socket.timeout(20000).emit('new_channel', channel, (err, responses)=>{
+    if(err){
+      console.log(err);
+      log_failure("new_channel", channel);
+    }
+  });
+}
+
+module.exports.broadcast_invite = (socket, invite)=>{
+  if(!ENABLE){
+    return false;
+  }
+  socket.timeout(20000).emit('new_invite', invite, (err, responses)=>{
+    if(err){
+      console.log(err);
+      log_failure("new_invite", invite);
+    }
+  });
+}
+
+module.exports.join_remote_channel = async (socket, channel_id, user_id)=>{
+  if(!ENABLE){
+    return false;
+  }
+  try{
+    return await new Promise((resolve, reject)=>{
+      socket.timeout(20000).emit('join', {"channel":channel_id, "user":user_id}, (err, responses)=>{
+        if(err){
+          console.log(err);
+          reject("an error occured.");
+          return;
+        }
+        if(Array.isArray(responses)){
+          for(const response of responses){
+            if(response.res == "ok"){
+              resolve(true);
+              return;
+            }
+          }
+        }else{
+          if(responses.res == "ok"){
+            resolve(true);
             return;
+          }
         }
-        
-	    function abort(){ 
-            req.unpipe(bb);
-            if(!req.aborted){ 
-                res.writeHead(413, { Connection:'close'});
-                res.end();
+        reject("no response");
+      });
+    });
+  }catch(err){
+    console.log("join_remote_channel promise rejection:"+err);
+    return false;
+  }
+}
+
+module.exports.load_offserver_channel = async (socket, channel)=>{
+  if(!ENABLE){
+    return false;
+  }
+  try{
+    var result = await new Promise((resolve, reject)=>{
+      socket.timeout(20000).emit('subscribe', {channel_id:channel}, (err, responses)=>{
+        if(err){
+          console.log(err);
+          reject("an error occured.");
+          return;
+        }
+        let res_server_id = false;
+        console.log("console log on line 51");
+        console.log(responses);
+        if(Array.isArray(responses)){//the sync client will recieve an object, while the sync server recieves an array
+          for(const response of responses){
+            if(response.res != "unavailable"){
+              res_server_id = response.res; //the response is server id of the responder
+              break;
             }
+          }
+        }else{
+          res_server_id = "master"; 
+        }
+        if(!res_server_id){
+          reject("unavailable");
+          return;
         }
 
-        bb.on('field', (name, val, info) => {
-            console.log(`${new Date().toUTCString()}  Field [${name}]: value: %j`, val);
-
-            if(name == "fileid"){
-                bb.on('file', (name, file, info)=>{
-                    const {filename, encoding, mimeType} = info;
-                    console.log(`File [${name}]: filename: %j, encoding:%j, mimeType: %j`,filename,encoding,mimeType);
-        
-                    const fsStream = fs.createWriteStream("./uploads/"+filename);
-                    file.pipe(fsStream);
-                    fsStream.on('close',()=>{
-                        console.log(`File [${name}] done`);
-                    });
-                });
+        if(res_server_id=="master"){
+          socket.timeout(20000).emit('download', {channel_id:channel}, (err, response)=>{//emit to master server
+            if(err){
+              reject("connection err");
+              return;
             }
-        });
-
-        bb.on('close', () => {
-            console.log('Done parsing form!');
-            res.writeHead(200, { Connection: 'close'});
-            res.end();
-        });
-
-        req.on("aborted", abort);
-        bb.on("error", abort);
-       
-        req.pipe(bb);
-    }else if(req.url == "/sync/query" && req.method == "POST"){
-        var body = "";
-        req.on('data', (chunk)=> {
-            body += chunk;
-        });
-        req.on('end', async ()=> {
-            console.log(new Date().toUTCString() + "  " + body);
-            body = JSON.parse(body);
-            var {id, sql, arguments} = body;
-            if(id != handler_incremental_id){
-                worker.postMessage({"from":"handler", id, sql, arguments});
-                console.log("Out of order. expected id:"+handler_incremental_id);
-                res.writeHead(200, { Connection: 'close'});
-                res.end();
-                return;
+            if(response.length){//check if array is not empty
+              for(const message of response){
+                //console.log(message);
+                db.savemessage(message.sender, message.channel, message.ID, message.timestamp, message.content).catch((err)=>console.log(err));
+              }
             }
-            handler_incremental_id ++;
+            resolve([response,res_server_id]);
+          })
+        }else{
+          socket.to(res_server_id).timeout(20000).emit('download', {channel_id:channel}, (err, response)=>{
+            if(err){
+              reject("connection err");
+              return;
+            }
+            if(response.length){//check if array is not empty
+              response=response[0];//socket.io gives an array on the server side
+              for(const message of response){
+                //console.log(message);
+                db.savemessage(message.sender, message.channel, message.ID, message.timestamp, message.content).catch((err)=>console.log(err));
+              }
+            }
+            resolve([response,res_server_id]);
+          })
+        }
+      });
+    });
+  }catch(err){
+    console.log("load_offserver_channel promise rejection:"+err);
+    return false;
+  }
 
-            await maindb.any_query(sql, arguments);
-            worker.postMessage({"from":"handler", "id":handler_incremental_id});
-
-            res.writeHead(200, { Connection: 'close'});
-            res.end();
-        });
-    }else if(req.url == "/sync/reset"){
-        handler_incremental_id = 0;
-    }else{
-        res.write("invalid\n");
-        res.end();
-    }
+  return result;
 }
 
+module.exports.query_user = async (socket, userid)=>{
+  return await new Promise((resolve)=>{
+    socket.timeout(20000).emit('getuser', userid, (err, response)=>{
+      if(err){
+        console.log("error on sync.js:96"+err);
+        reject("an error occured.");
+        return;
+      }
+      if(response && !Array.isArray(response)){
+        if(response.res != "unavailable"){
+          db.cache_user(response.ID, response.username, response.profile_pic);
+          if(response.profile_pic_file){
+            fs.writeFile(response.profile_pic, response.profile_pic_file, {root:__dirname+"/../"}, (err)=>{
+              console.log("error on sync.js:103"+err);
+            });
+          }
+          resolve(response);
+          return;
+        }
+      }
+      
+      if(Array.isArray(response)){
+        for(const response_ of response){
+          if(response_.res != "unavailable"){
+            db.cache_user(response_.ID, response_.username, response_.profile_pic);
+            if(response_.profile_pic_file){
+              fs.writeFile(response_.profile_pic, response_.profile_pic_file, {root:__dirname+"/../"}, (err)=>{
+                console.log("error on sync.js:117"+err);
+              });
+            }
+            resolve(response_);
+            return;
+          }
+        }
+      }
 
-//local to remote requests
-module.exports.syncFile = async (id, filepath)=>{
-    if(ENABLE){
-        worker.postMessage({"type":"file", "fileid":id, "file":fs.createReadStream(filepath)});
-    }
+      resolve(false);
+    });
+  });
 }
-
-module.exports.syncQuery = async (query, arguments)=>{
-    if(ENABLE) worker.postMessage({"type":"query", query, arguments});
-}
-
-
-const worker = new Worker("./sync_worker.js");
-worker.on('message', (message)=>handler_incremental_id=message);
-worker.on('error', (err)=>{throw err});
-worker.on('exit', (code) => {
-    if (code !== 0)
-        throw new Error(`Worker stopped with exit code ${code}`);
-});

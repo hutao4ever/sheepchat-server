@@ -1,15 +1,17 @@
 const { createClient,commandOptions } = require('redis');//cache db
 const maindb = require('./mysql_db');
-const { syncFile } = require('./sync');
 const db = createClient();
 
-const common_expiration = 60*60*24;
+const common_expiration = 60*60*10;
 
 db.connect();
 db.on("connect", ()=>{
     console.log("Connected to redis db.");
 });
 db.on('error', err => console.log('Redis Client Error', err));
+db.flushDb(); //wipe redis on start
+
+//warning: hSet does not allow any null values in an object
 
 async function user_lookup(identifier, cache = true){
     var user = await maindb.find_user(identifier);
@@ -30,10 +32,19 @@ async function user_lookup(identifier, cache = true){
 
 async function user(ID){
     var user = await db.hGetAll('user:'+ID);
-    if(!user.__proto__){
+    if(!user.ID){
         user = await maindb.get_user_by_id(ID);
     }
     return user;
+}
+
+async function cache_user(ID, username, pfp_path) {//cache user from another server
+    if(!pfp_path){
+        pfp_path="";
+    }
+    var user={"ID":ID, "username":username, "profile_pic":pfp_path};
+    await db.hSet(commandOptions({NX:true}), 'user:'+ID, user);
+    await db.expire(commandOptions({GT:true}),'user:'+ID, common_expiration);
 }
 
 //for saving user account data
@@ -56,7 +67,7 @@ async function edituser(id, username, password, profile_picture, email){
 
 //for saving, deleting and retrieving user messages
 async function savemessage(userid, channel, msgid, timestamp, content){
-    const messageobject = {"channel":channel,"sender":userid, "msgid":msgid, "timestamp":timestamp, "content":content};
+    const messageobject = {"channel":channel,"sender":userid, "ID":msgid, "timestamp":timestamp, "content":content};
     //await db.hSet(msgid, messageobject);
     await maindb.store_message(messageobject);
 }
@@ -78,8 +89,8 @@ async function getlength(channel_id){
 }
 
 //user list, join, create channel functions
-async function createchannel(id, name, owner_id){
-    await maindb.add_channel({'id':id,'name':name,'owner':owner_id,"icon":""});
+async function createchannel(id, name, owner_id, on_server=true){
+    await maindb.add_channel({'id':id,'name':name,'owner':owner_id,"icon":"","on_server":on_server});
 }
 async function deletechannel(id){
     return await maindb.transaction(async()=>{
@@ -96,8 +107,11 @@ async function get_channel_by_id(channel_id){
             channel.icon = "";
         }
         if(channel){
-            db.hSet("channel:"+channel_id, channel);
-            db.expire(commandOptions({GT:true}), "channel:"+channel_id, common_expiration);
+            if(channel.members==null){
+                channel.members="";
+            }
+            //db.hSet("channel:"+channel_id, channel);
+            //db.expire(commandOptions({GT:true}), "channel:"+channel_id, common_expiration);
         }
     }
     
@@ -107,17 +121,19 @@ async function editchannel(id, name, icon){
     var channel = await maindb.get_channel(id);
     if(name){channel.name = name}
     if(icon){channel.icon = icon}
-    db.hSet("channel:"+id, channel);
-    db.expire(commandOptions({GT:true}), "channel:"+id, common_expiration);
+    //db.hSet("channel:"+id, channel);
+    //db.expire(commandOptions({GT:true}), "channel:"+id, common_expiration);
     await maindb.update_channelinfo(channel);
 }
-async function add_channel_to_user(userid, channel_id){
-    var user_joinedchannels = await maindb.get_joinedchannels(userid);
-    if(!user_joinedchannels){
-        user_joinedchannels = [channel_id];
-    }else{
-        user_joinedchannels = JSON.parse(user_joinedchannels);
-        user_joinedchannels.push(channel_id);
+async function add_channel_to_user(userid, channel_id, user_on_server=true){
+    if(user_on_server){
+        var user_joinedchannels = await maindb.get_joinedchannels(userid);
+        if(!user_joinedchannels){
+            user_joinedchannels = [channel_id];
+        }else{
+            user_joinedchannels = JSON.parse(user_joinedchannels);
+            user_joinedchannels.push(channel_id);
+        }
     }
 
     var channel_memberslist = await maindb.get_channel(channel_id).members;
@@ -128,7 +144,9 @@ async function add_channel_to_user(userid, channel_id){
         channel_memberslist.push(userid);
     }
     maindb.transaction(async ()=>{
-        await maindb.update_joinedchannels(userid, user_joinedchannels, true);
+        if(user_on_server){
+            await maindb.update_joinedchannels(userid, user_joinedchannels, true);
+        }
         await maindb.update_channelmembers(channel_id, channel_memberslist, true);
     });
 }
@@ -170,11 +188,18 @@ async function listchannels(userid){
         
     return list;
 }
+async function get_member_list(channel_id){
+    const channel = await get_channel_by_id(channel_id);
+    if(!channel.members){
+        return [];
+    }
+    return JSON.parse(channel.members);
+}
 
 async function store_invite_code(code, channelid, expire){
     /*await db.set(`invitecode:${code}`, channelid);
     await db.expire(`invitecode:${code}`, expire);*/
-    maindb.store_invite_code(code, channelid, expire);
+    await maindb.store_invite_code(code, channelid, expire);
 }
 async function get_invite_channel(code){
     const invitation = await maindb.get_invite_code(code);
@@ -186,11 +211,6 @@ async function get_invite_channel(code){
         return invitation.channel_id;
     }
     return false;
-}
-
-async function get_member_list(channel_id){
-    const channel = await get_channel_by_id(channel_id);
-    return JSON.parse(channel.members);
 }
 
 //channel admin functions
@@ -216,7 +236,6 @@ async function save_attached_file(file_id, file_path){
     await maindb.store_filepath(file_id, file_path);
     await db.set(`uploadedFilePaths:${file_id}`, file_path);
     await db.expire(`uploadedFilePaths:${file_id}`, common_expiration);
-    syncFile(file_id, file_path);
 }
 async function get_attached_file(file_id){
     var file_path = await db.get(`uploadedFilePaths:${file_id}`);
@@ -231,10 +250,54 @@ async function get_attached_file(file_id){
     return file_path;
 }
 
+//server syncing functions
+async function subscribe_to(server_id, channel_id) {
+    await db.SADD("remote_subscribed", channel_id);
+    await db.SET(`remote_subscribed:${channel_id}`, server_id);
+    await db.SADD(`remote_subscribed_server:${server_id}`, channel_id);
+}
+async function unsubscribe_to(channel_id) {
+    await db.SREM("remote_subscribed", channel_id);
+    await db.DEL(`remote_subscribed:${channel_id}`);
+}
+async function unsubscribe_server(server_id){//remove all subscription to the remote server
+    var to_remove = await db.SMEMBERS(`remote_subscribed_server:${server_id}`);
+    if(to_remove){
+        to_remove.forEach((channel)=>{
+            unsubscribe_to(channel);
+        });
+    }
+}
+async function check_subscription_remote(channel_id) {
+    var subscribed = await db.SISMEMBER("remote_subscribed",channel_id);
+    if(subscribed == true){
+        var server_id = await db.GET(`remote_subscribed:${channel_id}`);
+        if(server_id){
+            return server_id;
+        }
+    }
+    return false;
+}
+async function subscribe(server_id, channel_id) {
+    await db.SADD("subscribe", channel_id);
+    await db.SET(`subscribe:${channel_id}`, server_id);
+}
+async function check_subscription(channel_id) {
+    var subscribed = await db.SISMEMBER("subscribe",channel_id);
+    if(subscribed == true){
+        var server_id = await db.GET(`subscribe:${channel_id}`);
+        if(server_id){
+            return server_id;
+        }
+    }
+    return false;
+}
+
 module.exports = {
     user_lookup,
     user,
     storeuser,
+    cache_user,
     savemessage,
     get_message_by_id,
     deletemessage,
@@ -242,8 +305,8 @@ module.exports = {
     getlength,
     createchannel,
     deletechannel,
-    add_channel_to_user: add_channel_to_user,
-    remove_channel_from_user:remove_channel_from_user,
+    add_channel_to_user,
+    remove_channel_from_user,
     editchannel,
     listchannels,
     store_invite_code,
@@ -256,5 +319,11 @@ module.exports = {
     get_channel_by_id,
     save_attached_file,
     get_attached_file,
-    edituser
+    edituser,
+    subscribe,
+    check_subscription,
+    subscribe_to,
+    unsubscribe_to,
+    unsubscribe_server,
+    check_subscription_remote
 }

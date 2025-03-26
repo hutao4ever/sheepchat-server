@@ -3,6 +3,8 @@ const db = require("../db")
 const bcrypt = require("bcrypt")
 const jwt = require("jsonwebtoken")
 const {jwtsecret} = require("../config/jwtsecret")
+const fs = require("fs")
+const path = require("path")
 
 module.exports.checkauth = (req, res) => {
     const time_millisec = Date.now();
@@ -52,9 +54,10 @@ module.exports.authenticate = async (req, res) => {
     req.session.userid = user.ID;
     req.session.username = user.username;
     req.session.token = token;
+    req.session.channels_joined = [];
     
     console.log("New session created for user: %s, user id is %s",username, user.ID);
-    return res.status(200).json({"status":"success", "username":user.username, "token":token});
+    return res.status(200).json({"status":"success", "username":user.username, "ID":user.ID, "token":token});
 }
 
 module.exports.renew_token = (req, username)=>{
@@ -126,20 +129,28 @@ module.exports.getprofilepic = async (req, res) => {
     
     if(req.query.userid){
         user = await db.user(req.query.userid);
+    }else if(req.session.userid){
+        user = await db.user(req.session.userid);
     }
 
-    if(!user && req.session.userid){
-        user = await db.user(req.session.userid);
+    if(!user){
+        return res.status(400).send("Invalid request.");
     }
     
     if(user.profile_pic){
-        res.status(200).sendFile(user.profile_pic, {root:__dirname+"/../"}, (err)=>{
-            res.sendFile("profilepics/placeholder.png", {root:__dirname+"/../"}, (err)=>{
-                if(err){
+        fs.stat(path.join(__dirname,"/../",user.profile_pic), (err,stat)=>{
+            if(err==null){
+                res.status(200).sendFile(user.profile_pic, {root:__dirname+"/../"}, (err)=>{
                     console.log(err);
-                }
-            });
-        });
+                });
+            }else if(err.code=="ENOENT"){
+                res.status(200).sendFile("profilepics/placeholder.png", {root:__dirname+"/../"}, (err)=>{
+                    if(err){
+                        console.log(err);
+                    }
+                });
+            }
+        })
     }else{
         res.status(200).sendFile("profilepics/placeholder.png", {root:__dirname+"/../"}, (err)=>{
             if(err){
@@ -147,6 +158,32 @@ module.exports.getprofilepic = async (req, res) => {
             }
         });
     }
+}
+
+module.exports.changepassword = async (req, res) => {
+    if(!req.session.userid){
+        return res.status(401).send("Unauthorized");
+    }
+    const {password_old, password_new} = req.body;
+    if(!password_old || !password_new){
+        return res.status(400).send("invalid");
+    }
+    if(password_new.length < 8 || password_new.length > 64){
+        return req.status(400).json({"status":"fail","error":"invalid"});
+    }
+    
+    const user = await db.user(req.session.userid);
+    console.log("user %s is trying to change password!", user.ID);
+
+    const password_validity = await bcrypt.compare(password_old, user.password);
+    if(!password_validity){
+        console.log("Old password mismatch");
+        return res.status(200).send({"status":"fail", "error":"mismatch"});
+    }
+    var salt = await bcrypt.genSalt();
+    var hash = await bcrypt.hash(password_new, salt);
+    await db.edituser(user.ID, null, hash, null, null);
+    return res.status(200).send({"status":"success"});
 }
 
 module.exports.editusername = async (req, res) => {
@@ -181,14 +218,17 @@ module.exports.editusername = async (req, res) => {
 }
 
 module.exports.lookupname = async (req, res) => {
-    if(!req.session.userid){
-        return res.status(401).send("Unauthorized");
-    }
     if(!req.query.userid){
         return res.status(400).send("invalid");
     }
 
-    user = await db.user(req.query.userid);
+    var user = await db.user(req.query.userid);
+
+    if(user){
+        return res.status(200).send(user.username);
+    }
+
+    user = await req.query_user(req.query.userid);
 
     if(user){
         return res.status(200).send(user.username);

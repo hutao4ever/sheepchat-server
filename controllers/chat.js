@@ -1,9 +1,11 @@
 const db = require("../db")
 const uuid = require("uuid")
 const {renew_token} = require("./user");
-const { nanoid, random } = require('nanoid');
+const { nanoid } = require('nanoid');
 const fs = require("fs");
 const path = require("path");
+const fetch = require('node-fetch');
+const FormData = require('form-data');
 
 module.exports.createchannel = async (req, res) => {
     if(!req.session.userid){
@@ -20,6 +22,8 @@ module.exports.createchannel = async (req, res) => {
     console.log(`user ${req.session.userid} is creating a channel:" ${name} "`);
 
     var channel_id = uuid.v4();
+    req.sync_channel({'id':channel_id,'name':name,'owner':req.session.userid});
+    
     await db.createchannel(channel_id, name, req.session.userid);
     await db.add_channel_to_user(req.session.userid, channel_id);
     req.session.channels_joined.push(channel_id);
@@ -71,7 +75,6 @@ module.exports.loadchannels = async (req, res) => {
     console.log("loading channels");
     const list = await db.listchannels(req.session.userid);
     var return_list = [];
-    req.session.channels_joined = [];
 
     for(let channel_id of list){
         const channel_obj = await db.get_channel_by_id(channel_id);
@@ -105,6 +108,21 @@ module.exports.loadmessage = async (req, res) => {
     if(!req.query.page || isNaN(parseInt(req.query.page)) || req.query.page < 0){
         res.status(400).send('page unspecified');
         return;
+    }
+    
+    const channel = await db.get_channel_by_id(req.query.channel);
+    if(channel.on_server==false){
+        console.log("loading off server channel...");
+        const server_id = await db.check_subscription_remote(req.query.channel);
+        if(!server_id){
+            const response = await req.load_offserver_channel(req.query.channel);
+            if(response){
+                await db.subscribe_to(response[1], req.query.channel);
+                return res.status(200).json({"status":"success","data":response[0]});
+            }else{   
+                return res.status(200).json({"status":"fail"});
+            }
+        }
     }
     
     var pageindex = parseInt(req.query.page);
@@ -228,8 +246,10 @@ module.exports.generate_join_code = async (req, res)=>{
         return;
     }
 
-    let random_code = nanoid();
-    await db.store_invite_code(random_code, channel, Math.floor(Date.now() / 1000)+60*60*48); //store a token that will expire in two days
+    const random_code = nanoid(10);
+    const expiration = Math.floor(Date.now() / 1000)+60*60*48;
+    await db.store_invite_code(random_code, channel, expiration); //store a token that will expire in two days
+    await req.sync_invite({"code":random_code, "channel":channel, "expire":expiration});
     return res.status(200).json({status:'success', code:random_code});
 }
 
@@ -267,6 +287,14 @@ module.exports.joinchannel = async (req, res)=>{
         return res.status(200).json({"status":"fail","err":"duplicate"});
     }
 
+    if(!channel_obj.on_server){
+        var result = await req.join_remote_channel(channel_id, req.session.userid);
+        if(!result){
+            return res.status(200).json({"status":"fail"});
+        }
+    }else{
+        await req.join_remote_channel(channel_id, req.session.userid);
+    }
     await db.add_channel_to_user(req.session.userid, channel_id);
     req.session.channels_joined.push(channel_id);
 
@@ -329,7 +357,8 @@ module.exports.get_channel_icon = async (req, res) => {
     const channel = await db.get_channel_by_id(req.query.channel_id);
 
     if(!channel){
-        return res.status(200).json({"status":"fail", "error":"not found"});
+        console.log("channel not found");
+        return res.status(404).json({"status":"fail", "error":"not found"});
     }
 
     if(channel.icon != ""){
@@ -339,23 +368,34 @@ module.exports.get_channel_icon = async (req, res) => {
             }
         });
     }
-    return res.status(404);
+
+    return res.status(404).json({"status":"fail", "error":"not found"});
 }
 
 module.exports.upload_file = async (req, res) => {
     var ids = [];
+    var filenames = [];
     var finish = false;
     var counter = 0;
+    var file_id_orig = false;
+    
     req.busboy.on('field', (fieldname, value)=>{
-        if(fieldname == "channel_id" && req.session.channels_joined.includes(value)){
-            console.log("valid upload channel_id:"+value);
+        if(fieldname == "file_id"||(fieldname == "channel_id" && req.session.channels_joined.includes(value))){
+            console.log("valid upload channel_id/file_id:"+value);
+            if(fieldname=="file_id"){
+                file_id_orig = value;
+            }
             req.busboy.on('file', (fieldname, file, fileinfo) => {
                 console.log(fileinfo);
                 if(file.truncated){file.resume(); return;}
                 counter ++;
             
                 const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-                var filename = 'user_uploaded-' + uniqueSuffix + path.extname(fileinfo.filename);
+                if(req.query.sync){//make sure the filename is the same on all servers
+                    var filename = fileinfo.filename;
+                }else{
+                    var filename = 'user_uploaded-' + uniqueSuffix + path.extname(fileinfo.filename);
+                }
 
                 var file_path = path.join('uploads/', filename);
                 // Create a write stream of the new file
@@ -366,12 +406,34 @@ module.exports.upload_file = async (req, res) => {
                 // On finish of the upload
                 fstream.on('close', () => {
                     counter --;
-                    const file_id = uuid.v4();
+                    if(file_id_orig){
+                        //make sure uuid is the same on all servers
+                        var file_id = file_id_orig;
+                    }else{
+                        var file_id = uuid.v4();
+                    }
+                    console.log(file_id);
                     db.save_attached_file(file_id, file_path);
                     ids.push(file_id);
+                    filenames.push(filename);
                     console.log(`Upload of '${filename}' finished`);
 
                     if(finish && counter == 0){ //if the whole request has been done
+                        if(!req.query.sync){ //send file to other servers
+                            req.file_share_peers().forEach((addr)=>{
+                                filenames.forEach((f,i)=>{
+                                    const form = new FormData();
+                                    let fileBuffer = fs.createReadStream(path.join('uploads/', f));
+                                    form.append("file_id",ids[i]);
+                                    form.append('file', fileBuffer, {filename:f});
+                                    url = new URL(req.baseUrl + req.path + "?sync=true", "http://"+addr);
+                                    fetch(url, { method: 'POST', body: form })
+                                    .then(res=>res.json())
+                                    .then(res=>console.log(res))
+                                    .catch((err)=>{console.log("File failed to reach peer."); console.log(err)});
+                                });
+                            });
+                        }
                         res.json({"status":"success", "all_ids":ids});//write response
                     }
                 });
@@ -383,7 +445,13 @@ module.exports.upload_file = async (req, res) => {
         finish = true;
     });
 
-    if(req.session.userid){
+    if("x-forwarded-for" in req.headers){
+        var ip = req.headers["x-forwarded-for"];
+    }else{
+        var ip = req.socket.remoteAddress;
+    }
+    
+    if(req.session.userid || (req.query.sync&&req.file_share_peers().includes(ip))){
         req.pipe(req.busboy);
     }else{
         return res.status(401).send("Unauthorized");
@@ -396,7 +464,6 @@ module.exports.get_file = async (req, res) => {
     return;
   }
   if(!req.query.id){
-    console.log("upload file id is not found!");
     res.status(400).send('no file id');
     return;
   }

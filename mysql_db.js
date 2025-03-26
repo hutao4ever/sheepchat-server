@@ -1,5 +1,4 @@
 const mysql = require("mysql");
-const {syncQuery} = require("./sync");
 const {host, user, password, database} = require("./config/dbcreds");
 
 const conn = mysql.createConnection({
@@ -72,7 +71,6 @@ module.exports.find_user = (identifier)=>{
 
 module.exports.add_user = (userobject)=>{
     const sql = "INSERT INTO Users (ID, profile_pic, password, email, username) VALUES (?,?,?,?,?)";
-    syncQuery(sql, [userobject.ID, userobject.profile_pic, userobject.password, userobject.email, userobject.username]);
     return new Promise(resolve=>{
         conn.query(sql, [userobject.ID, userobject.profile_pic, userobject.password, userobject.email, userobject.username], function(err, results, fields){
             if(err){throw err}
@@ -84,7 +82,6 @@ module.exports.add_user = (userobject)=>{
 
 module.exports.update_user = (userobject)=>{
     const sql = "UPDATE Users SET profile_pic = ?, password = ?, email = ?, username = ? WHERE ID = ?";
-    syncQuery(sql, [userobject.profile_pic, userobject.password, userobject.email, userobject.username, userobject.ID]);
     return new Promise(resolve=>{
         conn.query(sql, [userobject.profile_pic, userobject.password, userobject.email, userobject.username, userobject.ID], function(err, results, fields){
             if(err){throw err}
@@ -95,11 +92,10 @@ module.exports.update_user = (userobject)=>{
 }
 /* ---------------------------------------------channel-----------------------------------------*/
 module.exports.add_channel = (channelobject)=>{
-    const sql = "INSERT INTO Channels (ID, name, owner) VALUES (?,?,?)";
-    syncQuery(sql, [channelobject.id, channelobject.name, channelobject.owner]);
-    return new Promise(resolve=>{
-        conn.query(sql, [channelobject.id, channelobject.name, channelobject.owner], function(err, results, fields){
-            if(err){throw err}
+    const sql = "INSERT INTO Channels (ID, name, owner, icon, on_server) VALUES (?,?,?,?,?)";
+    return new Promise((resolve, reject)=>{
+        conn.query(sql, [channelobject.id, channelobject.name, channelobject.owner, channelobject.icon, channelobject.on_server], function(err, results, fields){
+            if(err){if(err.code=="ER_DUP_ENTRY"){reject("mysql-add_channel:duplicate")}else{throw err} return;}
             console.log(results);
             resolve(results);
         });
@@ -108,7 +104,6 @@ module.exports.add_channel = (channelobject)=>{
 
 module.exports.delete_channel_record = (channel_id)=>{
     const sql = "DELETE FROM Channels WHERE ID = ?";
-    syncQuery(sql, [channel_id]);
     return new Promise(resolve=>{
         conn.query(sql, [channel_id], function(err, results, fields){
             if(err){throw err}
@@ -135,7 +130,6 @@ module.exports.get_channel = (channel_id)=>{
 
 module.exports.update_channelinfo = (channel_object)=>{
     const sql = "UPDATE Channels SET name = ?, icon = ? WHERE ID = ?";
-    syncQuery(sql, [channel_object.name, channel_object.icon, channel_object.ID]);
     return new Promise(resolve=>{
         conn.query(sql, [channel_object.name, channel_object.icon, channel_object.ID], function(err, results, fields){
             if(err){
@@ -150,7 +144,6 @@ module.exports.update_channelinfo = (channel_object)=>{
 
 module.exports.update_channelmembers = (channel_id, channelmembers, transaction=false)=>{
     const sql = "UPDATE Channels SET members = ? WHERE ID = ?";
-    syncQuery(sql, [JSON.stringify(channelmembers), channel_id]);
     return new Promise(resolve=>{
         conn.query(sql, [JSON.stringify(channelmembers), channel_id], function(err, results, fields){
             if(err && transaction){
@@ -182,7 +175,6 @@ module.exports.get_joinedchannels = (user_id)=>{
 
 module.exports.update_joinedchannels = (user_id, joinedchannels, transaction=false)=>{
     const sql = "INSERT INTO joinedchannels (USERID, joinedchannels) VALUES (?,?) ON DUPLICATE KEY UPDATE joinedchannels = VALUES(joinedchannels)";
-    syncQuery(sql, [user_id, JSON.stringify(joinedchannels)]);
     return new Promise(resolve=>{
         conn.query(sql, [user_id, JSON.stringify(joinedchannels)], function(err, results, fields){
             if(err && transaction){
@@ -199,7 +191,6 @@ module.exports.update_joinedchannels = (user_id, joinedchannels, transaction=fal
 
 module.exports.store_invite_code = (code, channel_id, expiration)=>{
     const sql = "INSERT INTO invites (code, channel_id, expiration) VALUES (?,?,?)";
-    syncQuery(sql, [code, channel_id, expiration]);
     return new Promise(resolve=>{
         conn.query(sql, [code, channel_id, expiration], function(err, results, fields){
             if(err){throw err}
@@ -237,10 +228,9 @@ module.exports.delete_invite_code = (code)=>{
 /* ---------------------------------------------message-----------------------------------------*/
 module.exports.store_message = (messageobject)=>{
     const sql = "INSERT INTO messages (ID, channel, sender, content, timestamp) VALUES (?,?,?,?,?)";
-    syncQuery(sql, [messageobject.msgid, messageobject.channel, messageobject.sender, JSON.stringify(messageobject.content), messageobject.timestamp]);
-    return new Promise(resolve=>{
-        conn.query(sql, [messageobject.msgid, messageobject.channel, messageobject.sender, JSON.stringify(messageobject.content), messageobject.timestamp], function(err, results, fields){
-            if(err){throw err}
+    return new Promise((resolve,reject)=>{
+        conn.query(sql, [messageobject.ID, messageobject.channel, messageobject.sender, JSON.stringify(messageobject.content), messageobject.timestamp], function(err, results, fields){
+            if(err){if(err.code=="ER_DUP_ENTRY"){reject("mysql-store_message:duplicate")}else{throw err} return;}
             console.log(results);
             resolve(results);
         });
@@ -257,21 +247,24 @@ module.exports.get_messages = (channel_id, start, length)=>{
     });
 }
 
-module.exports.get_message = (msgid)=>{
+module.exports.get_message = (ID)=>{
     const sql = "SELECT * FROM messages WHERE ID = ?";
     return new Promise(resolve=>{
-        conn.query(sql, [msgid], function(err, results, fields){
+        conn.query(sql, [ID], function(err, results, fields){
             if(err){throw err}
-            resolve(results);
+            if(results.length == 0){
+                resolve(false);
+                return;
+            }
+            resolve(results[0]);
         });
     });
 }
 
-module.exports.delete_message = (msgid)=>{
-    const sql = "DELETE FROM messages WHERE ID = ?";
-    syncQuery(sql, [msgid]);
+module.exports.delete_message = (ID)=>{
+    const sql = "DELETE FROM messages WHERE ID = ?";//TODO: instead of deleting the row altogether, just overwrite the content
     return new Promise(resolve=>{
-        conn.query(sql, [msgid], function(err, results, fields){
+        conn.query(sql, [ID], function(err, results, fields){
             if(err){throw err}
             resolve(results);
         });
@@ -280,7 +273,6 @@ module.exports.delete_message = (msgid)=>{
 
 module.exports.delete_all_message_from_channel = (channel_id)=>{
     const sql = "DELETE FROM messages WHERE channel = ?";
-    syncQuery(sql, [channel_id]);
     return new Promise(resolve=>{
         conn.query(sql, [channel_id], function(err, results, fields){
             if(err){throw err}
@@ -291,7 +283,6 @@ module.exports.delete_all_message_from_channel = (channel_id)=>{
 
 module.exports.store_filepath = (fileid, filepath)=>{
     const sql = "INSERT INTO uploaded (ID, path) VALUES (?, ?)";
-    syncQuery(sql, [fileid, filepath]);
     return new Promise(resolve=>{
         conn.query(sql, [fileid, filepath], function(err, results, fields){
             if(err){throw err}
